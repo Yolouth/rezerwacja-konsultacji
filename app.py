@@ -28,7 +28,9 @@ if frontend_url:
     CORS(app, resources={r"/api/*": {"origins": [frontend_url]}})
 
 db = SQLAlchemy(app)
-
+with app.app_context():
+    db.create_all()
+    print("---!!! TABELE BAZY DANYCH ZOSTAŁY UTWORZONE !!!---")
 scheduler = BackgroundScheduler(timezone='Europe/Warsaw')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
