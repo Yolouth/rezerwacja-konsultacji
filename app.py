@@ -36,8 +36,8 @@ POLAND_TZ = pytz.timezone('Europe/Warsaw')
 EMAIL_CONFIG = {
     'smtp_server': os.environ.get('SMTP_SERVER', 'smtp.gmail.com'),
     'smtp_port': int(os.environ.get('SMTP_PORT', 587)),
-    'email': os.environ.get('TRAINER_EMAIL'),
-    'password': os.environ.get('TRAINER_EMAIL_PASSWORD')
+    'email': os.environ.get('TRAINER_EMAIL'),  # Adres e-mail NOWEGO konta (używany jako nadawca)
+    'password': os.environ.get('TRAINER_EMAIL_PASSWORD') # Hasło do aplikacji
 }
 
 SCOPES = ['https://www.googleapis.com/auth/calendar']
@@ -93,12 +93,18 @@ def create_google_calendar_event(booking):
     training_datetime = POLAND_TZ.localize(datetime.combine(booking.training_date, booking.training_time))
     end_datetime = training_datetime + timedelta(hours=1)
     
+    # Adres e-mail, na który ma przyjść powiadomienie dla trenera (główny mail klienta)
+    trainer_main_email = os.environ.get('TRAINER_MAIN_EMAIL', EMAIL_CONFIG['email'])
+    
     event = {
         'summary': f'Konsultacja fitness - {booking.client_name}',
         'description': f"Klient: {booking.client_name}\nEmail: {booking.client_email}\nTelefon: {booking.phone or 'Nie podano'}",
         'start': {'dateTime': training_datetime.isoformat(), 'timeZone': 'Europe/Warsaw'},
         'end': {'dateTime': end_datetime.isoformat(), 'timeZone': 'Europe/Warsaw'},
-        'attendees': [{'email': booking.client_email}],
+        'attendees': [
+            {'email': booking.client_email},
+            {'email': trainer_main_email} # Dodajemy trenera jako uczestnika wydarzenia
+        ],
         'reminders': {'useDefault': False, 'overrides': [{'method': 'email', 'minutes': 24 * 60}, {'method': 'popup', 'minutes': 60}]},
     }
     
@@ -112,6 +118,11 @@ def create_google_calendar_event(booking):
 
 def send_email(to_email, subject, body):
     try:
+        # Sprawdzamy czy mamy wszystkie dane do wysyłki
+        if not all([EMAIL_CONFIG['email'], EMAIL_CONFIG['password']]):
+            logger.error("Brak konfiguracji e-mail (TRAINER_EMAIL, TRAINER_EMAIL_PASSWORD). Nie można wysłać maila.")
+            return False
+            
         msg = MIMEMultipart()
         msg['From'] = EMAIL_CONFIG['email']
         msg['To'] = to_email
@@ -133,11 +144,6 @@ def send_booking_confirmation_email(booking):
     subject = "Potwierdzenie rezerwacji konsultacji"
     body = f"Witaj {booking.client_name}!\n\nDziękuję za rezerwację konsultacji.\nData: {booking.training_date.strftime('%d.%m.%Y')}\nGodzina: {booking.training_time.strftime('%H:%M')}"
     return send_email(booking.client_email, subject, body)
-
-def send_trainer_notification_email(booking):
-    subject = f"Nowa rezerwacja konsultacji - {booking.client_name}"
-    body = f"Nowa rezerwacja!\nKlient: {booking.client_name}\nEmail: {booking.client_email}\nData: {booking.training_date.strftime('%d.%m.%Y')} o {booking.training_time.strftime('%H:%M')}"
-    return send_email(EMAIL_CONFIG['email'], subject, body)
 
 def send_reminder_email(booking):
     with app.app_context():
@@ -171,17 +177,17 @@ def process_booking_in_background(app_context, booking_id):
     with app_context:
         booking = db.session.get(Booking, booking_id)
         if not booking:
-            logger.error(f'TŁO: Nie znaleziono rezerwacji #{booking_id}')
             return
 
         google_event_id = create_google_calendar_event(booking)
         if google_event_id:
             booking.google_event_id = google_event_id
             db.session.commit()
-            logger.info(f'TŁO: Dodano wydarzenie do kalendarza dla rezerwacji #{booking_id}')
 
+        # Wysyłamy maila z potwierdzeniem tylko do klienta rezerwującego
         send_booking_confirmation_email(booking)
-        send_trainer_notification_email(booking)
+        
+        # Planujemy przypomnienie dla klienta rezerwującego
         schedule_reminder(booking)
         
         logger.info(f'TŁO: Zakończono przetwarzanie rezerwacji #{booking_id}')
@@ -235,9 +241,5 @@ def book_training():
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
-    
-    # Uruchomienie schedulera w tle
     scheduler.start()
-    
-    # Uruchomienie aplikacji Flask
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
