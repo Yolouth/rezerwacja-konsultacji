@@ -28,7 +28,6 @@ if frontend_url:
     CORS(app, resources={r"/api/*": {"origins": [frontend_url]}})
 
 db = SQLAlchemy(app)
-
 scheduler = BackgroundScheduler(timezone='Europe/Warsaw')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -112,21 +111,80 @@ def create_google_calendar_event(booking):
         return None
 
 def send_email(to_email, subject, body):
-    # Twoja oryginalna logika wysyłania maili...
-    pass
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = EMAIL_CONFIG['email']
+        msg['To'] = to_email
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain', 'utf-8'))
+
+        server = smtplib.SMTP(EMAIL_CONFIG['smtp_server'], EMAIL_CONFIG['smtp_port'])
+        server.starttls()
+        server.login(EMAIL_CONFIG['email'], EMAIL_CONFIG['password'])
+        server.send_message(msg)
+        server.quit()
+        logger.info(f'Email wysłany do: {to_email}')
+        return True
+    except Exception as e:
+        logger.error(f'Błąd podczas wysyłania emaila: {e}')
+        return False
+
+def send_booking_confirmation_email(booking):
+    subject = "Potwierdzenie rezerwacji konsultacji"
+    body = f"Witaj {booking.client_name}!\n\nDziękuję za rezerwację konsultacji.\nData: {booking.training_date.strftime('%d.%m.%Y')}\nGodzina: {booking.training_time.strftime('%H:%M')}"
+    return send_email(booking.client_email, subject, body)
+
+def send_trainer_notification_email(booking):
+    subject = f"Nowa rezerwacja konsultacji - {booking.client_name}"
+    body = f"Nowa rezerwacja!\nKlient: {booking.client_name}\nEmail: {booking.client_email}\nData: {booking.training_date.strftime('%d.%m.%Y')} o {booking.training_time.strftime('%H:%M')}"
+    return send_email(EMAIL_CONFIG['email'], subject, body)
+
+def send_reminder_email(booking):
+    with app.app_context():
+        subject = "Przypomnienie o konsultacji fitness - jutro!"
+        body = f"Witaj {booking.client_name}!\n\nTo przypomnienie o Twojej konsultacji fitness, która odbędzie się jutro o {booking.training_time.strftime('%H:%M')}."
+        if send_email(booking.client_email, subject, body):
+            booking_to_update = db.session.get(Booking, booking.id)
+            if booking_to_update:
+                booking_to_update.reminder_sent = True
+                db.session.commit()
+                logger.info(f'Przypomnienie wysłane dla rezerwacji #{booking.id}')
+
+def schedule_reminder(booking):
+    try:
+        reminder_datetime = datetime.combine(booking.training_date - timedelta(days=1), time(18, 0))
+        reminder_datetime_aware = POLAND_TZ.localize(reminder_datetime)
+
+        if reminder_datetime_aware > datetime.now(POLAND_TZ):
+            scheduler.add_job(
+                func=send_reminder_email,
+                trigger=DateTrigger(run_date=reminder_datetime_aware),
+                args=[booking],
+                id=f'reminder_{booking.id}',
+                replace_existing=True
+            )
+            logger.info(f'Zaplanowano przypomnienie na {reminder_datetime_aware} dla rezerwacji #{booking.id}')
+    except Exception as e:
+        logger.error(f'Błąd podczas planowania przypomnienia: {e}')
 
 def process_booking_in_background(app_context, booking_id):
     with app_context:
         booking = db.session.get(Booking, booking_id)
         if not booking:
+            logger.error(f'TŁO: Nie znaleziono rezerwacji #{booking_id}')
             return
 
         google_event_id = create_google_calendar_event(booking)
         if google_event_id:
             booking.google_event_id = google_event_id
             db.session.commit()
+            logger.info(f'TŁO: Dodano wydarzenie do kalendarza dla rezerwacji #{booking_id}')
+
+        send_booking_confirmation_email(booking)
+        send_trainer_notification_email(booking)
+        schedule_reminder(booking)
         
-        # Logika wysyłania maili...
+        logger.info(f'TŁO: Zakończono przetwarzanie rezerwacji #{booking_id}')
 
 # --- 5. GŁÓWNE ENDPOINTY APLIKACJI ---
 @app.route('/api/available-slots', methods=['GET'])
@@ -177,4 +235,9 @@ def book_training():
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
+    
+    # Uruchomienie schedulera w tle
+    scheduler.start()
+    
+    # Uruchomienie aplikacji Flask
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
